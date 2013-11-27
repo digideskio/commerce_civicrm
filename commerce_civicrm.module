@@ -131,6 +131,23 @@ function commerce_civicrm_form_commerce_order_ui_order_form_alter(&$form, &$form
   }
 }
 
+/**
+  * Implements hook_commerce_customer_profile_type_info().
+  */
+function commerce_civicrm_commerce_customer_profile_type_info() {
+  $profile_types = array();
+   
+  $profile_types['civicrm'] = array(
+    'type' => 'civicrm',
+    'name' => t('CiviCRM'),
+    'description' => t('The profile used to associate a Commerce Order with a CiviCRM contact'),
+    'help' => '',
+    'addressfield' => FALSE,
+  );
+
+  return $profile_types;
+}
+
 
 /**
  * Update CiviCRM contact when order is updated.
@@ -293,23 +310,88 @@ function commerce_civicrm_action_order_civicrm($order) {
   if (!civicrm_initialize()) {
     return;
   }
+  
+  $profile = FALSE;
+  
+  // Load the CiviCRM Profile
+  if (!empty($order->commerce_customer_civicrm)) {
+    $profile_id = $order->commerce_customer_civicrm[LANGUAGE_NONE][0]['profile_id'];
+    $civicrm = commerce_customer_profile_load($profile_id);
+  }
+  
+    
+  // Get the CID if it's been set.
+  if (!empty($civicrm->contact)) {
+    $cid = $civicrm->contact[LANGUAGE_NONE][0]['contact_id'];
+    
+    // Get the Contact
+    $params = array('version' => 3, 'id' => $cid);
+    $result = civicrm_api('Contact', 'get', $params);
+    
+    // If the contact has an email
+    // Update the order with the email
+    if (!empty($result['id']) && !empty($result['values'][$result['id']])) {
+      $contact = $result['values'][$result['id']];
+      if (!empty($contact['email'])) {
+        if ($order->mail != $contact['email']) {
+          $order->mail = $contact['email'];
+          
+          // Update the DB directly to
+          // stop recurssion of this function.
+          $query = db_update('commerce_order');
+          $query->fields(array(
+            'mail' => $order->mail,
+          ));
+          $query->condition('order_id', $order->order_id);
+          $query->execute();
+          
+          // Also update the current revision
+          $query = db_update('commerce_order_revision');
+          $query->fields(array(
+            'mail' => $order->mail,
+          ));
+          $query->condition('order_id', $order->order_id);
+          $query->condition('revision_id', $order->revision_id);
+          $query->execute();
+          
+        }        
+      }
+    }
+  }
+  
+  // If the CID and the email is empty nothing more can be done.
+  if (empty($cid) && empty($order->mail)) {
+    return;
+  }
 
   // Find or create a CiviCRM contact ID for the customer.
-  $cid = _commerce_civicrm_get_cid($order);
-  if (!$cid) {
+  if (empty($cid)) {
+    $cid = _commerce_civicrm_get_cid($order);
+  }
+  if (empty($cid)) {
     $params = array('version' => 3, 'contact_type' => 'Individual', 'email' => $order->mail);
     $result = civicrm_api('contact', 'create', $params);
     $cid = $result['id'];
   }
 
+  // If the contact is not pre-existing
   // Update the contact.
-  _commerce_civicrm_update_contact($cid, $order);
+  if (!empty($cid) && empty($civicrm->contact[LANGUAGE_NONE])) {
+    _commerce_civicrm_update_contact($cid, $order);
+  }
+  
+  // If a contact was created, add it to the profile
+  if (!empty($civicrm) && empty($civicrm->contact[LANGUAGE_NONE]) && !empty($cid)) {
+    $civicrm->contact[LANGUAGE_NONE][0]['contact_id'] = $cid;
+    commerce_customer_profile_save($civicrm);
+  }
 
   // Add the contribution record.
   _commerce_civicrm_add_contribution($cid, $order);
 
   // Add this contact to selected groups.
   _commerce_civicrm_add_to_groups($cid);
+  
 }
 
 
@@ -574,8 +656,33 @@ function _commerce_civicrm_create_custom_contribution_fields() {
  */
 function _commerce_civicrm_add_contribution($cid, &$order) {
   _commerce_civicrm_create_custom_contribution_fields();
+  
+  $params = array(
+    'version' => 3,
+  );
+    
+  require_once 'api/v2/Contribute.php';
 
   $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  
+  $search['invoice_id'] = $order->order_id . '_dc';
+  $search['returnFirst'] = TRUE;
+  $existing = civicrm_contribution_get($search);
+  
+  if (!empty($existing['contribution_id'])) {
+    $params['contribution_id'] = $existing['contribution_id'];
+  }
+  
+  // If the order is no longer in the databse, it's been deleted
+  // and the Contribution should be deleted as well.
+  $current = commerce_order_load($order->order_id);
+  if (empty($current) && !empty($params)) {
+    $contribution = civicrm_api('Contribution', 'delete', $params);
+    if (civicrm_error($contribution)) {
+      watchdog('commerce_civicrm', 'civicrm_contribution_add(): %error', array('%error' => $contribution['error_message']), WATCHDOG_ERROR);
+    }
+    return TRUE;
+  }
 
   // TODO: how to handle multiple transactions on one order?
   $transactions = commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id));
@@ -611,7 +718,7 @@ function _commerce_civicrm_add_contribution($cid, &$order) {
   }
 
   $notes = _commerce_civicrm_create_detail_string($order_wrapper);
-  $params = array(
+  $params += array(
     'contact_id' => $cid,
     'receive_date' => date('Ymd'),
     'total_amount' => $order_total,
@@ -626,6 +733,7 @@ function _commerce_civicrm_add_contribution($cid, &$order) {
     'contribution_status_id' => _commerce_civicrm_map_contribution_status($order->status),
     'note' => $notes,
   );
+  
   if (!empty($tax_field_id)) {
     $params['custom_' . $tax_field_id] = $tax_total;
   }
@@ -638,9 +746,13 @@ function _commerce_civicrm_add_contribution($cid, &$order) {
     $function = $module . '_commerce_civicrm_contribution_params';
     $function($params, $order, $cid);
   }
-
-  require_once 'api/v2/Contribute.php';
-  $contribution = civicrm_contribution_add($params);
+  
+  if (empty($existing['contribution_id'])) {
+    $contribution = civicrm_api('Contribution', 'create', $params);
+  }
+  else {
+    $contribution = civicrm_api('Contribution', 'update', $params);
+  }
 
   // Log the error, but continue.
   if (civicrm_error($contribution)) {

@@ -1,0 +1,46 @@
+<?php
+
+/**
+  * Implements hook_install().
+  */
+function commerce_civicrm_install() {
+
+  $profile_types = commerce_civicrm_commerce_customer_profile_type_info();
+  $profile_type = $profile_types['civicrm'];
+  
+  commerce_customer_configure_customer_profile_type($profile_type);
+  
+  commerce_order_configure_customer_profile_type($profile_type['type'], $profile_type['name']);
+  
+  $field = array(
+    'field_name' => 'contact',
+    'type' => 'civicrm_contact_ref_contact',
+    'cardinality' => 1,
+  );
+  field_create_field($field);
+
+  $instance = array(
+    'field_name' => 'contact',
+    'entity_type' => 'commerce_customer_profile',
+    'label' => 'Contact',
+    'bundle' => 'civicrm',
+    'widget' => array(
+      'type' => 'civicrm_contact_ref_autocomplete',
+    ),
+  );
+  field_create_instance($instance);
+   
+}
+
+/**
+  * Implements hook_uninstall().
+  */
+function commerce_civicrm_uninstall() {
+  
+  $instance = field_info_instance('commerce_customer_profile', 'civicrm', 'contact');
+  
+  field_delete_instance($instance);
+  
+  commerce_customer_commerce_customer_profile_delete('civicrm_contact');
+     
+}
