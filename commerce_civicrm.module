@@ -8,6 +8,48 @@
  */
 
 /**
+ * @TODO Known bugs while working on #1975106.
+ *
+ * - Duplicate Billing address creation for each new order.
+ *
+ * - Matches existing contacts with empty email addresses and
+ *   overwrites. Since this happens for every presave, even before the
+ *   email can be provided, it happens for every anonymous purchase.
+ *
+ * - Runs repeatedly for every order change, resulting in 4x
+ *   processing for a single order flow.
+ *
+ * - Does not account for domains, so mismatches contacts if Commerce
+ *   is running on a secondary domain.
+ *
+ * - Tries to create Drupal Commerce Purchases group and fields every time?
+ *
+ * - Not sure what to make of "Cannot change contribution status from
+ *   In Progress to Completed". Think we're getting bad input to a
+ *   validation function.
+ *
+ *    Notice: Undefined variable: itemStatus in
+ *    CRM_Financial_BAO_FinancialItem::add() (line 96 of
+ *    /var/www/australianbreastfeeding/www.mothersdirect.com.au/sites/mothersdirect.com.au/modules/civicrm/CRM/Financial/BAO/FinancialItem.php).
+ *
+ *    Notice: Undefined index: In Progress in
+ *    CRM_Contribute_BAO_Contribution::checkStatusValidation() (line
+ *    2852 of
+ *    /var/www/australianbreastfeeding/www.mothersdirect.com.au/sites/mothersdirect.com.au/modules/civicrm/CRM/Contribute/BAO/Contribution.php).
+ *
+ *    Warning: in_array() expects parameter 2 to be array, null given
+ *    in CRM_Contribute_BAO_Contribution::checkStatusValidation()
+ *    (line 2852 of
+ *    /var/www/australianbreastfeeding/www.mothersdirect.com.au/sites/mothersdirect.com.au/modules/civicrm/CRM/Contribute/BAO/Contribution.php).
+ *
+ *    CiviCRM API error in
+ *    /var/www/australianbreastfeeding/www.mothersdirect.com.au/sites/mothersdirect.com.au/modules/civicrm/api/api.php
+ *    @ 272: Cannot change contribution status from In Progress to
+ *    Completed.
+ *
+ */
+
+/**
  * Implements hook_help().
  */
 function commerce_civicrm_help($path = 'admin/help#commerce_civicrm') {
@@ -97,8 +139,8 @@ function commerce_civicrm_civicrm_links($op, $objectName, $objectId) {
   if ($cid && is_numeric($cid)) {
     // Get the Drupal uid for the CiviCRM contact if there is a match
     $params = array('contact_id' => $cid, 'version' => 3);
-    $uf_match = civicrm_api('uf_match', 'get', $params);
-    if ($uf_match['id'] && count($uf_match['values'] == 1)) {
+    $uf_match = civicrm_api3('uf_match', 'get', $params);
+    if (!empty($uf_match['id']) && count($uf_match['values'] == 1)) {
       $uid = $uf_match['id'];
     }
     switch ($objectName) {
@@ -121,7 +163,7 @@ function commerce_civicrm_civicrm_links($op, $objectName, $objectId) {
  * @param $form_state
  */
 function commerce_civicrm_form_commerce_order_ui_order_form_alter(&$form, &$form_state) {
-  if (!isset($form_state['commerce_order']->order_id) && $_GET['cid'] && is_numeric($_GET['cid'])) {
+  if (!isset($form_state['commerce_order']->order_id) && !empty($_GET['cid']) && is_numeric($_GET['cid'])) {
     commerce_civicrm_prefill_order_form_with_civi_data($form, $form_state, $_GET['cid']);
   }
 }
@@ -153,11 +195,13 @@ function commerce_civicrm_commerce_customer_profile_type_info() {
  * @see rules_invoke_all()
  */
 function commerce_civicrm_commerce_order_presave($order) {
+  watchdog('commerce_civicrm', 'Order: <pre>!order</pre>', array('!order' => var_export($order,1)), WATCHDOG_DEBUG);
+//  $bt = debug_backtrace();
+//  watchdog('commerce_civicrm', 'Backtrace: <pre>!bt</pre>', array('!bt' => print_r($bt,1)), WATCHDOG_DEBUG);
   // Only update when a new order revision is being saved.
   if (isset($order->old_revision_id)) {
     // Update the contact if we have one.
-    $cid = _commerce_civicrm_get_cid($order);
-    if ($cid) {
+    if ($cid = _commerce_civicrm_get_cid($order)) {
       _commerce_civicrm_update_contact($cid, $order);
     }
   }
@@ -250,6 +294,8 @@ function commerce_civicrm_display_contact_transactions($customer, $count = FALSE
  * Admin form configuration.
  */
 function commerce_civicrm_admin() {
+  civicrm_initialize();
+  _commerce_civicrm_create_custom_contribution_fields();
   if (!civicrm_initialize()) {
     return;
   }
@@ -275,9 +321,11 @@ function commerce_civicrm_admin() {
     }
   }
   catch (Exception $e) {
-    drupal_set_message(t('CiviCRM API error: %message', array('%message' => $e->getMessage())), 'error');
+    drupal_set_message(t('CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine())), 'error');
+    watchdog('commerce_civicrm', 'CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine()), WATCHDOG_ERROR);
+    dpm($e->getTrace(), 'trace');
   }
-  natsort($options);
+  natsort($types);
 
   $form = array();
   $form['commerce_civicrm_contribution_type'] = array(
@@ -306,6 +354,27 @@ function commerce_civicrm_admin() {
  *   the order
  */
 function commerce_civicrm_action_order_civicrm($order) {
+  $billing_address = array();
+  if ($wrapper = entity_metadata_wrapper('commerce_order', $order)) {
+    if (isset($wrapper->commerce_customer_billing->commerce_customer_address)) {
+      if ($billing_address = $wrapper->commerce_customer_billing->commerce_customer_address->value()) {
+        //dpm($billing_address, 'Got billing address.');
+      }
+      else {
+        // This happens when the order is in its early stages. We may
+        // want to exit here in order to avoid vaping legit contact
+        // details in favour of yet-unset billing address details?
+        drupal_set_message('Billing address not yet available.', 'error');
+      }
+    }
+    else {
+      //dpm('$wrapper->commerce_customer_billing->commerce_customer_address not set.');
+    }
+  }
+  else {
+    //dpm('Order wrapper could not be retrieved.');
+  }
+
   if (!civicrm_initialize()) {
     return;
   }
@@ -314,83 +383,102 @@ function commerce_civicrm_action_order_civicrm($order) {
 
   // Load the CiviCRM Profile
   if (!empty($order->commerce_customer_civicrm)) {
+    //dpm('Loading CiviCRM Profile.');
     $profile_id = $order->commerce_customer_civicrm[LANGUAGE_NONE][0]['profile_id'];
-    $civicrm = commerce_customer_profile_load($profile_id);
+    $profile = commerce_customer_profile_load($profile_id);
   }
 
+  try {
+    // Get the CID if it's been set.
+    if (!empty($profile->contact)) {
+      //dpm('Getting CID if set.');
+      $cid = $profile->contact[LANGUAGE_NONE][0]['contact_id'];
 
-  // Get the CID if it's been set.
-  if (!empty($civicrm->contact)) {
-    $cid = $civicrm->contact[LANGUAGE_NONE][0]['contact_id'];
+      // Get the Contact
+      $params = array('version' => 3, 'id' => $cid);
+      $result = civicrm_api3('Contact', 'get', $params);
 
-    // Get the Contact
-    $params = array('version' => 3, 'id' => $cid);
-    $result = civicrm_api('Contact', 'get', $params);
+      // If the contact has an email
+      // Update the order with the email
+      if (!empty($result['id']) && !empty($result['values'][$result['id']])) {
+        //dpm('Found contact, updating order email.');
+        $contact = $result['values'][$result['id']];
+        if (!empty($contact['email'])) {
+          //dpm('Contact email is not empty.');
+          if ($order->mail != $contact['email']) {
+            //dpm('Contact email != order email.');
+            $order->mail = $contact['email'];
 
-    // If the contact has an email
-    // Update the order with the email
-    if (!empty($result['id']) && !empty($result['values'][$result['id']])) {
-      $contact = $result['values'][$result['id']];
-      if (!empty($contact['email'])) {
-        if ($order->mail != $contact['email']) {
-          $order->mail = $contact['email'];
+            // Update the DB directly to stop recursion of this
+            // function.
+            $query = db_update('commerce_order');
+            $query->fields(array(
+                'mail' => $order->mail,
+              ));
+            $query->condition('order_id', $order->order_id);
+            $query->execute();
 
-          // Update the DB directly to
-          // stop recurssion of this function.
-          $query = db_update('commerce_order');
-          $query->fields(array(
-            'mail' => $order->mail,
-          ));
-          $query->condition('order_id', $order->order_id);
-          $query->execute();
-
-          // Also update the current revision
-          $query = db_update('commerce_order_revision');
-          $query->fields(array(
-            'mail' => $order->mail,
-          ));
-          $query->condition('order_id', $order->order_id);
-          $query->condition('revision_id', $order->revision_id);
-          $query->execute();
-
+            // Also update the current revision
+            $query = db_update('commerce_order_revision');
+            $query->fields(array(
+                'mail' => $order->mail,
+              ));
+            $query->condition('order_id', $order->order_id);
+            $query->condition('revision_id', $order->revision_id);
+            $query->execute();
+          }
         }
       }
     }
+
+    // Find or create a CiviCRM contact ID for the customer.
+    if (empty($cid)) {
+      $cid = _commerce_civicrm_get_cid($order);
+      //dpm(t('CID was empty, got cid %cid.', array('%cid' => $cid)));
+    }
+
+    // If cid is still empty but we have a mail, create a contact.
+    if (empty($cid) && !empty($order->mail)) {
+      //dpm('CID is still empty, creating a contact.');
+      $params = array(
+        'version' => 3,
+        'contact_type' => 'Individual',
+      );
+      $params['email'] = $order->mail;
+      $result = civicrm_api3('contact', 'create', $params);
+      $cid = $result['id'];
+    }
+
+    // If the CID and the email is STILL empty, nothing to do.
+    if (empty($cid) && empty($order->mail)) {
+      //dpm('Exiting because no CID or email.');
+      return;
+    }
+
+    // If the contact is not pre-existing, update the contact.
+    if (!empty($cid) && empty($profile->contact[LANGUAGE_NONE])) {
+      //dpm('Updating order.');
+      _commerce_civicrm_update_contact($cid, $order);
+    }
+
+    // If a contact was created, add it to the profile
+    if (!empty($profile) && empty($profile->contact[LANGUAGE_NONE]) && !empty($cid)) {
+      //dpm('Contact was created, adding to profile.');
+      $profile->contact[LANGUAGE_NONE][0]['contact_id'] = $cid;
+      commerce_customer_profile_save($profile);
+    }
+
+    // Add the contribution record.
+    _commerce_civicrm_add_contribution($cid, $order);
+
+    // Add this contact to selected groups.
+    _commerce_civicrm_add_to_groups($cid);
   }
-
-  // If the CID and the email is empty nothing more can be done.
-  if (empty($cid) && empty($order->mail)) {
-    return;
+  catch (Exception $e) {
+    drupal_set_message(t('CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine())), 'error');
+    watchdog('commerce_civicrm', 'CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine()), WATCHDOG_ERROR);
+    dpm($e->getTrace(), 'trace');
   }
-
-  // Find or create a CiviCRM contact ID for the customer.
-  if (empty($cid)) {
-    $cid = _commerce_civicrm_get_cid($order);
-  }
-  if (empty($cid)) {
-    $params = array('version' => 3, 'contact_type' => 'Individual', 'email' => $order->mail);
-    $result = civicrm_api('contact', 'create', $params);
-    $cid = $result['id'];
-  }
-
-  // If the contact is not pre-existing
-  // Update the contact.
-  if (!empty($cid) && empty($civicrm->contact[LANGUAGE_NONE])) {
-    _commerce_civicrm_update_contact($cid, $order);
-  }
-
-  // If a contact was created, add it to the profile
-  if (!empty($civicrm) && empty($civicrm->contact[LANGUAGE_NONE]) && !empty($cid)) {
-    $civicrm->contact[LANGUAGE_NONE][0]['contact_id'] = $cid;
-    commerce_customer_profile_save($civicrm);
-  }
-
-  // Add the contribution record.
-  _commerce_civicrm_add_contribution($cid, $order);
-
-  // Add this contact to selected groups.
-  _commerce_civicrm_add_to_groups($cid);
-
 }
 
 /**
@@ -413,14 +501,13 @@ function _commerce_civicrm_add_to_groups($cid) {
           'group_id' => $key
         );
         $result = civicrm_api3('GroupContact', 'create', $params);
-        if (!empty($result['is_error'])) {
-          watchdog('commerce_civicrm', 'Error adding contact to group: %error', array('%error' => $result['error_message']), WATCHDOG_ERROR);
-        }
       }
     }
   }
   catch (Exception $e) {
-    watchdog('commerce_civicrm', 'civicrm_contact_search(): %error', array('%error' => $e->getMessage()), WATCHDOG_ERROR);
+    drupal_set_message(t('CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine())), 'error');
+    watchdog('commerce_civicrm', 'CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine()), WATCHDOG_ERROR);
+    dpm($e->getTrace(), 'trace');
   }
 }
 
@@ -449,27 +536,33 @@ function _commerce_civicrm_get_cid($order) {
       $params = array(
         'uf_id' => $order->uid,
       );
+      //dpm($params, 'uf_id params');
       $result = civicrm_api3('UFMatch', 'get', $params);
+      if (!empty($result['values'])) {
+        $match = reset($result['values']);
+        //dpm($match['contact_id'], 'uf_id');
+        return $match['contact_id'];
+      }
+    }
+
+    // Anonymous user. If we have an email, look in the CiviCRM
+    // contacts table for a contact that matches the primary email.
+    if (isset($order->mail) && !empty($order->mail)) {
+      $params = array(
+        'email' => $order->mail,
+        'return.contact_id' => TRUE
+      );
+      $result = civicrm_api3('Contact', 'get', $params);
       if (!empty($result['values'])) {
         $match = reset($result['values']);
         return $match['contact_id'];
       }
     }
-
-    // Anonymous user.
-    // Look in the CiviCRM contacts table for a contact that matches the primary email.
-    $params = array(
-      'email' => $order->mail,
-      'return.contact_id' => TRUE
-    );
-    $result = civicrm_api3('Contact', 'get', $params);
-    if (!empty($result['values'])) {
-      $match = reset($result['values']);
-      return $match['contact_id'];
-    }
   }
   catch (Exception $e) {
-    watchdog('commerce_civicrm', 'civicrm_contact_search(): %error', array('%error' => $e->getMessage()), WATCHDOG_ERROR);
+    drupal_set_message(t('CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine())), 'error');
+    watchdog('commerce_civicrm', 'CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine()), WATCHDOG_ERROR);
+    dpm($e->getTrace(), 'trace');
   }
   return FALSE;
 }
@@ -581,7 +674,7 @@ function _commerce_civicrm_update_contact($cid, $order) {
       }
 
       // Shipping location.
-      $address = array(
+      $params = array(
         'contact_id'             => $cid,
         'location_type_id'       => $location_type_id,
         'location_type'          => 'Home',
@@ -594,17 +687,19 @@ function _commerce_civicrm_update_contact($cid, $order) {
         'country'                => $shipping_address['country'],
       );
       civicrm_api3('Address', 'create', $params);
-
     }
   }
   catch (Exception $e) {
-    watchdog('commerce_civicrm', 'civicrm_location_update(): %error', array('%error' => $e->getMessage()), WATCHDOG_ERROR);
+    drupal_set_message(t('CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine())), 'error');
+    watchdog('commerce_civicrm', 'CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine()), WATCHDOG_ERROR);
+    dpm($e->getTrace(), 'trace');
   }
 }
 
 
 /**
- * Creates required contribution fields if they have not already been created.
+ * Creates required contribution fields if they have not already been
+ * created.
  */
 function _commerce_civicrm_create_custom_contribution_fields() {
   $group_id = variable_get('commerce_civicrm_contribution_group_id', FALSE);
@@ -662,7 +757,9 @@ function _commerce_civicrm_create_custom_contribution_fields() {
     }
   }
   catch (Exception $e) {
-    watchdog('commerce_civicrm', 'civicrm_location_update(): %error', array('%error' => $e->getMessage()), WATCHDOG_ERROR);
+    drupal_set_message(t('CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine())), 'error');
+    watchdog('commerce_civicrm', 'CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine()), WATCHDOG_ERROR);
+    dpm($e->getTrace(), 'trace');
   }
 }
 
@@ -682,7 +779,8 @@ function _commerce_civicrm_add_contribution($cid, &$order) {
     $params = array(
       'invoice_id' => $order->order_id . '_dc',
     );
-    $result = civicrm_api('Contribution', 'get', $params);
+
+    $result = civicrm_api3('Contribution', 'get', $params);
     if (!empty($result['values'])) {
       $contribution = reset($result['values']);
       $existing_id = $contribution['id'];
@@ -767,10 +865,13 @@ function _commerce_civicrm_add_contribution($cid, &$order) {
       $function($params, $order, $cid);
     }
 
+    //dpm($params, 'Contribution create');
     civicrm_api3('Contribution', 'create', $params);
   }
   catch (Exception $e) {
-    watchdog('commerce_civicrm', 'CiviCRM API error: %error', array('%error' => $e->getMessage()), WATCHDOG_ERROR);
+    drupal_set_message(t('CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine())), 'error');
+    watchdog('commerce_civicrm', 'CiviCRM API error in %file @ %line: %message', array('%message' => $e->getMessage(), '%file' => $e->getFile(), '%line' => $e->getLine()), WATCHDOG_ERROR);
+    dpm($e->getTrace(), 'trace');
   }
 
   return TRUE;
